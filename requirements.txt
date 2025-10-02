@@ -1,0 +1,7 @@
+streamlit==1.37.1
+pandas>=2.1.0
+numpy>=1.24.0
+matplotlib>=3.8.0
+statsmodels>=0.14.1
+scipy>=1.11.0
+pmdarima>=2.0.4
