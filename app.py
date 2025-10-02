@@ -4,12 +4,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 from statsmodels.stats.stattools import jarque_bera
-from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from scipy import stats
 import warnings
@@ -17,9 +16,9 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Soya ARIMA/SARIMA/SARIMAX Selector", layout="wide")
 
-# ----------------------------
+# ============================
 # Limpieza de datos
-# ----------------------------
+# ============================
 
 def replace_nonfinite(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -93,9 +92,9 @@ def clean_pipeline(s: pd.Series, do_winsor=True, q_low=0.01, q_high=0.99,
     masks = {"capped": capped_mask, "interp": interp_mask, "ffill": ffill_mask, "bfill": bfill_mask}
     return s3, report, masks
 
-# ----------------------------
-# Helpers de modelado
-# ----------------------------
+# ============================
+# Helpers de modelado y frecuencia
+# ============================
 
 def try_parse_dates(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
@@ -112,16 +111,22 @@ def find_date_col(df: pd.DataFrame) -> Optional[str]:
                 pass
     return candidates[0] if len(candidates) else None
 
-def ensure_monthly(series: pd.Series) -> pd.Series:
-    s = series.dropna().sort_index()
-    if s.index.inferred_freq in [None, "D", "B", "W", "QS", "Q", "A", "H", "T", "S"]:
+def ensure_monthly_series(s: pd.Series) -> pd.Series:
+    s = s.dropna().sort_index()
+    try:
         return s.resample("M").mean().dropna()
-    if s.index.inferred_freq and "M" in s.index.inferred_freq:
-        return s.asfreq("M")
-    return s.resample("M").mean().dropna()
+    except Exception:
+        return s
+
+def ensure_monthly_df(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.sort_index()
+    try:
+        return X.resample("M").mean().dropna(how="all")
+    except Exception:
+        return X
 
 def train_test_split_monthly(s: pd.Series, eval_start="2023-01-01", eval_end="2025-05-31") -> Tuple[pd.Series, pd.Series]:
-    s = ensure_monthly(s)
+    s = ensure_monthly_series(s)
     train = s[s.index < pd.to_datetime(eval_start)]
     test  = s[(s.index >= pd.to_datetime(eval_start)) & (s.index <= pd.to_datetime(eval_end))]
     return train, test
@@ -180,8 +185,8 @@ def diagnostics(res) -> Dict[str, float]:
         "resid": resid
     }
 
-def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
-    return {
+def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic, extra: Optional[dict]=None):
+    out = {
         "model": kind,
         "order": order,
         "seasonal_order": seasonal_order,
@@ -193,9 +198,103 @@ def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
         "arch_p": diag["arch_p"],
         "forecast": fc
     }
+    if extra:
+        out.update(extra)
+    return out
 
-def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, max_pq=3,
-                       K_fourier=(1,2,3), mape_threshold=None, enforce_threshold=False) -> Dict[str, Any]:
+# ============================
+# Auto-selección de exógenas (columnas + lags hasta 12)
+# ============================
+
+def auto_select_exog_and_lags(
+    y_train: pd.Series,
+    df_indexed: pd.DataFrame,
+    candidate_cols: List[str],
+    max_base_cols: int = 3,
+    max_lag: int = 12,
+    max_total_features: int = 12,
+    min_abs_corr: float = 0.20,
+    winsor=True, q_low=0.01, q_high=0.99,
+    interp=True, interp_method="linear",
+    ffill=True, bfill=True,
+    standardize=False
+):
+    """
+    Elige automáticamente cuáles columnas exógenas y qué lags (0..max_lag) incluir.
+    - Prioriza |correlación| con y_train y evita colinealidad (>0.95) entre features.
+    - Limita a 'max_base_cols' columnas base y a 'max_total_features' columnas finales.
+    Devuelve (X, lags_por_col). X alineada a y_train (índice mensual).
+    """
+    if not candidate_cols:
+        return None, {}
+
+    candidates = []  # (score, col, lag, series_shifted)
+    for col in candidate_cols:
+        s = df_indexed[col].astype(float)
+        s_clean, _, _ = clean_pipeline(s, winsor, q_low, q_high, interp, interp_method, ffill, bfill, log_mode="none")
+        s_m = ensure_monthly_series(s_clean)
+        for L in range(0, max_lag + 1):
+            x = s_m.shift(L).reindex(y_train.index)
+            if x.isna().all() or x.std(ddof=0) == 0:
+                continue
+            r = x.corr(y_train)
+            score = float(abs(r)) if pd.notna(r) else 0.0
+            candidates.append((score, col, L, x))
+
+    # Orden descendente por score
+    candidates.sort(key=lambda t: t[0], reverse=True)
+
+    selected_series = []
+    selected_names = []
+    chosen_map: dict[str, list[int]] = {}
+    base_cols_used: set[str] = set()
+
+    for score, col, L, x in candidates:
+        if len(selected_series) >= max_total_features:
+            break
+
+        # no superar número de columnas base
+        if col not in base_cols_used and len(base_cols_used) >= max_base_cols:
+            continue
+
+        # permite al menos un predictor; luego exige min_abs_corr
+        if score < min_abs_corr and len(selected_series) > 0:
+            continue
+
+        # evitar colinealidad con lo ya seleccionado
+        if selected_series:
+            corrs = [abs(x.corr(s)) for s in selected_series if s.std(ddof=0) > 0]
+            if len(corrs) and max(corrs) > 0.95:
+                continue
+
+        selected_series.append(x)
+        selected_names.append(f"{col}_lag{L}")
+        chosen_map.setdefault(col, []).append(L)
+        base_cols_used.add(col)
+
+    if not selected_series:
+        return None, {}
+
+    X = pd.concat([s.rename(n) for s, n in zip(selected_series, selected_names)], axis=1)
+    if standardize:
+        X = (X - X.mean()) / X.std(ddof=0)
+
+    X = ensure_monthly_df(X).reindex(y_train.index)
+    return X, chosen_map
+
+# ============================
+# Grid search (con exógenas/Fourier)
+# ============================
+
+def grid_search_models(
+    train: pd.Series, test: pd.Series,
+    seasonal_period=12, max_pq=3,
+    exog_train: Optional[pd.DataFrame]=None,
+    exog_test:  Optional[pd.DataFrame]=None,
+    include_fourier=True, K_fourier=(1,2,3),
+    mape_threshold=None, enforce_threshold=False
+) -> Dict[str, Any]:
+
     results = []
     d = select_differencing(train)
 
@@ -224,21 +323,48 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
                 except Exception:
                     continue
 
-    # SARIMAX (Fourier exog)
-    for K in K_fourier:
-        exog_train = fourier_terms(train.index, period=seasonal_period, K=K)
-        exog_test  = fourier_terms(test.index,  period=seasonal_period, K=K)
+    # SARIMAX con exógenas del dataset
+    if exog_train is not None and exog_test is not None and exog_train.shape[1] > 0:
         for p in range(0, max_pq+1):
             for q in range(0, max_pq+1):
                 for D in [0,1]:
                     try:
-                        res = fit_sarimax(train, order=(p,d,q), seasonal_order=(p, D, q, seasonal_period), exog=exog_train)
+                        res = fit_sarimax(train, order=(p,d,q), seasonal_order=(p,D,q,seasonal_period), exog=exog_train)
                         fc = res.get_forecast(steps=len(test), exog=exog_test).predicted_mean
                         fc.index = test.index
                         diag = diagnostics(res)
-                        results.append(record_result(f"SARIMAX(K={K})", (p,d,q), (p,D,q,seasonal_period), f"Fourier K={K}", test, fc, diag, res.aic))
+                        exog_desc = f"exog={list(exog_train.columns)}"
+                        results.append(record_result("SARIMAX(exog)", (p,d,q), (p,D,q,seasonal_period), exog_desc, test, fc, diag, res.aic,
+                                                     extra={"exog_cols": list(exog_train.columns), "fourier_k": None}))
                     except Exception:
                         continue
+
+    # SARIMAX con exógenas + Fourier (o sólo Fourier)
+    if include_fourier:
+        for K in K_fourier:
+            ft_train = fourier_terms(train.index, period=seasonal_period, K=K)
+            ft_test  = fourier_terms(test.index,  period=seasonal_period, K=K)
+            if exog_train is not None and exog_test is not None and exog_train.shape[1] > 0:
+                Xtr = pd.concat([exog_train, ft_train], axis=1)
+                Xte = pd.concat([exog_test,  ft_test], axis=1)
+                tag = f"exog+K={K}"
+            else:
+                Xtr, Xte = ft_train, ft_test
+                tag = f"K={K}"
+            for p in range(0, max_pq+1):
+                for q in range(0, max_pq+1):
+                    for D in [0,1]:
+                        try:
+                            res = fit_sarimax(train, order=(p,d,q), seasonal_order=(p,D,q,seasonal_period), exog=Xtr)
+                            fc = res.get_forecast(steps=len(test), exog=Xte).predicted_mean
+                            fc.index = test.index
+                            diag = diagnostics(res)
+                            exog_desc = f"{'exog+' if 'exog' in tag else ''}Fourier K={K}"
+                            results.append(record_result(f"SARIMAX({tag})", (p,d,q), (p,D,q,seasonal_period), exog_desc, test, fc, diag, res.aic,
+                                                         extra={"exog_cols": list(exog_train.columns) if exog_train is not None else [],
+                                                                "fourier_k": int(K)}))
+                        except Exception:
+                            continue
 
     df = pd.DataFrame(results)
     if len(df)==0:
@@ -249,7 +375,6 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
     df["meets_thresh"] = df["mape"] <= (mape_threshold if mape_threshold is not None else np.inf)
 
     best_row = None
-
     if mape_threshold is not None:
         diag_and_thr = df[df["passes_all"] & df["meets_thresh"]]
         if len(diag_and_thr) > 0:
@@ -283,6 +408,10 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
 
     return {"summary": df.sort_values(["passes_all","passes_count","mape","aic"], ascending=[False, False, True, True]), "best": best_row}
 
+# ============================
+# Plots & refits
+# ============================
+
 def plot_series(train, test, fc, title):
     fig, ax = plt.subplots(figsize=(10,4))
     train.plot(ax=ax, label="Train")
@@ -294,25 +423,21 @@ def plot_series(train, test, fc, title):
     st.pyplot(fig)
 
 def plot_residuals(resid, title_prefix=""):
-    # Serie de residuos
     fig, ax = plt.subplots(figsize=(10,3))
     resid.plot(ax=ax)
     ax.set_title(f"{title_prefix} Residuals over time")
     st.pyplot(fig)
 
-    # Histograma
     fig, ax = plt.subplots(figsize=(6,3))
     ax.hist(resid, bins=20, alpha=0.7)
     ax.set_title(f"{title_prefix} Residuals Histogram")
     st.pyplot(fig)
 
-    # Q-Q
     fig = plt.figure(figsize=(6,3))
     stats.probplot(resid, dist="norm", plot=plt)
     plt.title(f"{title_prefix} Q-Q plot")
     st.pyplot(fig)
 
-    # ACF / PACF
     fig_acf = plt.figure(figsize=(6,3))
     plot_acf(resid, lags=min(24, len(resid)//2), ax=plt.gca())
     plt.title(f"{title_prefix} Residuals ACF")
@@ -323,65 +448,59 @@ def plot_residuals(resid, title_prefix=""):
     plt.title(f"{title_prefix} Residuals PACF")
     st.pyplot(fig_pacf)
 
-def fit_best_model_for_summary(best: dict, train: pd.Series, seasonal_period: int):
-    """Refit del mejor modelo sobre el conjunto de entrenamiento para obtener .summary()."""
-    model_name = str(best.get("model", ""))
-    order = tuple(best.get("order", (0, 0, 0)))
-    seasonal_order = tuple(best.get("seasonal_order", (0, 0, 0, 0)))
+def fit_best_model_for_summary(best: dict, train: pd.Series, seasonal_period: int,
+                               exog_train: Optional[pd.DataFrame]=None):
+    order = tuple(best.get("order", (0,0,0)))
+    seasonal_order = tuple(best.get("seasonal_order", (0,0,0,0)))
+    X = None
 
-    if model_name.startswith("SARIMAX"):
-        import re as _re
-        m = _re.search(r"K=(\d+)", model_name)
-        k = int(m.group(1)) if m else 1
-        exog_train = fourier_terms(train.index, period=int(seasonal_period), K=k)
-        res = SARIMAX(train, order=order, seasonal_order=seasonal_order,
-                      exog=exog_train, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-    else:
-        res = SARIMAX(train, order=order, seasonal_order=seasonal_order,
-                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    # Exógenas seleccionadas (si existen en best)
+    if best.get("exog_cols"):
+        X = exog_train
+
+    # Fourier (si corresponde)
+    k = best.get("fourier_k", None)
+    if k is not None:
+        ft_train = fourier_terms(train.index, period=int(seasonal_period), K=int(k))
+        X = ft_train if X is None else pd.concat([X, ft_train], axis=1)
+
+    res = SARIMAX(train, order=order, seasonal_order=seasonal_order,
+                  exog=X, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
     return res
 
-def find_forecast_series(summary_df, best_dict):
-    """Encuentra la serie de pronóstico para el modelo 'best'. Si no coincide exactamente, usa la primera fila como respaldo."""
-    try:
-        mask = (
-            (summary_df["model"] == best_dict.get("model")) &
-            (summary_df["order"] == tuple(best_dict.get("order", (0,0,0)))) &
-            (summary_df["seasonal_order"] == tuple(best_dict.get("seasonal_order", (0,0,0,0)))) &
-            (summary_df["mape"] == best_dict.get("mape"))
-        )
-        subset = summary_df[mask]
-        if len(subset) == 0 and len(summary_df) > 0:
-            subset = summary_df.iloc[[0]]
-        row = subset.iloc[0]
-        return row.get("forecast", None)
-    except Exception:
-        return None
-
-def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_period):
-    if model_name.startswith("SARIMAX"):
-        import re
-        m = re.search(r"K=(\d+)", model_name)
-        k = int(m.group(1)) if m else 1
-        exog_train = fourier_terms(train.index, period=seasonal_period, K=k)
-        res = SARIMAX(train, order=order, seasonal_order=seasonal_order, exog=exog_train,
-                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-    else:
-        res = SARIMAX(train, order=order, seasonal_order=seasonal_order,
-                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+def refit_and_get_resid(best: dict, train: pd.Series, seasonal_period: int,
+                        exog_train: Optional[pd.DataFrame]=None):
+    res = fit_best_model_for_summary(best, train, seasonal_period, exog_train)
     return res.resid.dropna()
 
-# ----------------------------
-# UI
-# ----------------------------
+def forecast_best(best: dict, train: pd.Series, test: pd.Series, seasonal_period: int,
+                  exog_train: Optional[pd.DataFrame], exog_test: Optional[pd.DataFrame]):
+    order = tuple(best["order"]); seasonal_order = tuple(best["seasonal_order"])
+    Xtr = exog_train if best.get("exog_cols") else None
+    Xte = exog_test  if best.get("exog_cols") else None
+    k = best.get("fourier_k", None)
+    if k is not None:
+        ft_train = fourier_terms(train.index, period=int(seasonal_period), K=int(k))
+        ft_test  = fourier_terms(test.index,  period=int(seasonal_period), K=int(k))
+        Xtr = ft_train if Xtr is None else pd.concat([Xtr, ft_train], axis=1)
+        Xte = ft_test  if Xte is None else pd.concat([Xte, ft_test], axis=1)
+
+    res_tmp = SARIMAX(train, order=order, seasonal_order=seasonal_order,
+                      exog=Xtr, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    fc = res_tmp.get_forecast(steps=len(test), exog=Xte).predicted_mean
+    fc.index = test.index
+    return fc
+
+# ============================
+# UI principal
+# ============================
 
 st.title("Modelado del Grano de Soya: ARIMA vs SARIMA vs SARIMAX")
 st.caption("Criterios: normalidad, no autocorrelación, no heterocedasticidad y MAPE mínimo en la evaluación (2023-01 a 2025-05).")
 
 with st.sidebar:
     st.header("Datos")
-    default_path = "C:\\Tito\\Gary\\soya_limpio_ddmmyyyy.csv"
-    #default_path = "/mnt/data/soya_limpio_ddmmyyyy.csv"
+    default_path = "/mnt/data/soya_limpio_ddmmyyyy.csv"
     uploaded = st.file_uploader("Sube el CSV", type=["csv"])
     path = st.text_input("o ruta del CSV", value=default_path)
     eval_start = st.text_input("Inicio evaluación (YYYY-MM-DD)", value="2023-01-01")
@@ -389,22 +508,6 @@ with st.sidebar:
     max_pq = st.slider("Máx p y q", 1, 5, 3)
     seasonal_period = st.number_input("Periodo estacional (m)", min_value=4, max_value=24, value=12)
     K_min, K_max = st.slider("Fourier K (SARIMAX)", 1, 6, (1,3))
-
-    st.header("Limpieza de datos")
-    do_winsor = st.checkbox("Capar outliers (winsorizar)", value=True)
-    q_low, q_high = st.slider("Percentiles de capping", 0.0, 0.2, (0.01, 0.99))
-    do_interp = st.checkbox("Interpolar huecos (lineal)", value=True)
-    interp_method = st.selectbox("Método de interpolación", ["linear","time","nearest","polynomial"], index=0)
-    do_ffill = st.checkbox("Relleno hacia adelante (ffill)", value=True)
-    do_bfill = st.checkbox("Relleno hacia atrás (bfill)", value=True)
-    log_mode = st.selectbox("Transformación", ["none","log","log1p"], index=0)
-
-    robust_mode = st.checkbox("Modo robusto (auto-sanar)", value=True)
-    min_train_months = st.number_input("Mínimo meses en Train", min_value=6, max_value=48, value=12)
-
-    st.header("Criterio MAPE")
-    mape_thr = st.number_input("Umbral MAPE objetivo (%)", min_value=0.1, max_value=50.0, value=4.0, step=0.1)
-    enforce_thr = st.checkbox("Exigir umbral MAPE (descartar modelos que no lo cumplan)", value=True)
 
 # Carga de datos
 if uploaded is not None:
@@ -420,23 +523,61 @@ st.dataframe(df.head(10))
 
 date_col = find_date_col(df)
 if date_col is None:
-    st.error("No se pudo detectar la columna de fecha. Por favor, selecciona una columna válida llamada por ejemplo 'fecha' o 'date'.")
+    st.error("No se pudo detectar la columna de fecha. Usa una columna como 'fecha' o 'date'.")
     st.stop()
 
 df[date_col] = try_parse_dates(df[date_col])
 df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
 
-target_candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-if not target_candidates:
-    st.error("No se encontró una columna numérica para modelar (precio).")
+# Columnas numéricas disponibles
+num_cols_all = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+if not num_cols_all:
+    st.error("No hay columnas numéricas en el dataset.")
     st.stop()
-target = target_candidates[0]
+
+# Selección de objetivo (primera numérica por defecto)
+target = num_cols_all[0]
 st.write(f"**Fecha:** `{date_col}` | **Objetivo:** `{target}`")
 
+# ---- Controles de limpieza (objetivo) ----
+with st.sidebar:
+    st.header("Limpieza de objetivo")
+    do_winsor = st.checkbox("Capar outliers (winsorizar)", value=True)
+    q_low, q_high = st.slider("Percentiles de capping", 0.0, 0.2, (0.01, 0.99))
+    do_interp = st.checkbox("Interpolar huecos (lineal)", value=True)
+    interp_method = st.selectbox("Método de interpolación", ["linear","time","nearest","polynomial"], index=0)
+    do_ffill = st.checkbox("Relleno hacia adelante (ffill)", value=True)
+    do_bfill = st.checkbox("Relleno hacia atrás (bfill)", value=True)
+    log_mode = st.selectbox("Transformación", ["none","log","log1p"], index=0)
+
+    st.header("Exógenas")
+    exog_mode = st.selectbox("Modo de exógenas", ["Automático", "Manual", "Ninguna"], index=0)
+    exog_standardize = st.checkbox("Estandarizar exógenas (z-score)", value=False)
+    max_base_cols = st.number_input("Máx. columnas base (auto)", min_value=1, max_value=10, value=3)
+    max_total_features = st.number_input("Máx. features finales (auto)", min_value=1, max_value=30, value=12)
+    min_abs_corr = st.slider("Umbral |corr| mínimo (auto)", 0.0, 0.8, 0.20, 0.01)
+
+    exog_cols_user = []
+    if exog_mode == "Manual":
+        exog_candidates = [c for c in num_cols_all if c != target]
+        exog_cols_user = st.multiselect("Selecciona columnas exógenas (manual)", exog_candidates, default=[])
+
+    include_fourier = st.checkbox("Añadir Fourier a SARIMAX", value=True,
+                                  help="Si no se usan exógenas, SARIMAX probará Fourier solo. Si hay exógenas, probará exógenas+Fourier.")
+
+    st.header("Robustez")
+    robust_mode = st.checkbox("Modo robusto (auto-sanar)", value=True)
+    min_train_months = st.number_input("Mínimo meses en Train", min_value=6, max_value=48, value=12)
+
+    st.header("Criterio MAPE")
+    mape_thr = st.number_input("Umbral MAPE objetivo (%)", min_value=0.1, max_value=50.0, value=4.0, step=0.1)
+    enforce_thr = st.checkbox("Exigir umbral MAPE", value=True)
+
+# ---- Limpieza + mensualización del objetivo ----
 series_raw = df[target].astype(float)
 series, clean_report, masks = clean_pipeline(series_raw, do_winsor, q_low, q_high, do_interp, interp_method, do_ffill, do_bfill, log_mode)
 
-with st.expander("Reporte de limpieza", expanded=False):
+with st.expander("Reporte de limpieza (objetivo)", expanded=False):
     st.write({
         "NA iniciales": clean_report["initial_na"],
         "Winsor aplicado": clean_report["winsor_applied"],
@@ -446,31 +587,57 @@ with st.expander("Reporte de limpieza", expanded=False):
         "Observaciones totales": clean_report["length"]
     })
     fig, ax = plt.subplots(figsize=(10,3))
-    ensure_monthly(series_raw).plot(ax=ax, label="Crudo (mensualizado)")
-    ensure_monthly(series).plot(ax=ax, label="Limpio (mensualizado)")
+    ensure_monthly_series(series_raw).plot(ax=ax, label="Crudo (mensualizado)")
+    ensure_monthly_series(series).plot(ax=ax, label="Limpio (mensualizado)")
     ax.set_title("Validación de limpieza")
     ax.legend()
     st.pyplot(fig)
-    interventions = pd.DataFrame({
-        "capped": masks["capped"],
-        "interp": masks["interp"],
-        "ffill": masks["ffill"],
-        "bfill": masks["bfill"],
-    })
-    if interventions.any(axis=1).any():
-        st.write("Matriz de intervenciones (True=aplicado):")
-        st.dataframe(interventions[interventions.any(axis=1)])
 
 series = series.dropna()
 train, test = train_test_split_monthly(series, eval_start=eval_start, eval_end=eval_end)
 
-st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
+# ---- Exógenas (auto o manual; lags 0..12 automáticos) ----
+X_all = None
+exog_lags_map = {}
+if exog_mode == "Automático":
+    candidates = [c for c in num_cols_all if c != target]
+    X_all, exog_lags_map = auto_select_exog_and_lags(
+        y_train=train, df_indexed=df, candidate_cols=candidates,
+        max_base_cols=int(max_base_cols), max_lag=12, max_total_features=int(max_total_features),
+        min_abs_corr=float(min_abs_corr),
+        winsor=do_winsor, q_low=q_low, q_high=q_high,
+        interp=do_interp, interp_method=interp_method,
+        ffill=do_ffill, bfill=do_bfill,
+        standardize=exog_standardize
+    )
+elif exog_mode == "Manual" and len(exog_cols_user) > 0:
+    X_all, exog_lags_map = auto_select_exog_and_lags(
+        y_train=train, df_indexed=df, candidate_cols=exog_cols_user,
+        max_base_cols=len(exog_cols_user), max_lag=12, max_total_features=int(max_total_features),
+        min_abs_corr=float(min_abs_corr),
+        winsor=do_winsor, q_low=q_low, q_high=q_high,
+        interp=do_interp, interp_method=interp_method,
+        ffill=do_ffill, bfill=do_bfill,
+        standardize=exog_standardize
+    )
 
-# Auto-sanar si es necesario
+if X_all is not None:
+    if robust_mode and (X_all.isna().any().any() or not np.isfinite(X_all.values).all()):
+        X_all = X_all.replace([np.inf, -np.inf], np.nan).interpolate(method="time").interpolate(method="linear").ffill().bfill()
+        if X_all.isna().any().any():
+            X_all = X_all.fillna(X_all.median())
+
+X_train = X_all.loc[train.index] if X_all is not None else None
+X_test  = X_all.loc[test.index]  if X_all is not None else None
+
+st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
+if exog_lags_map:
+    st.info(f"Lags seleccionados automáticamente: {exog_lags_map}")
+
+# Auto-sanar train si hace falta
 if robust_mode:
     if train.isna().any() or not np.isfinite(train.values).all():
-        train = train.replace([np.inf, -np.inf], np.nan)
-        train = train.interpolate(method="time").interpolate(method="linear").ffill().bfill()
+        train = train.replace([np.inf, -np.inf], np.nan).interpolate(method="time").interpolate(method="linear").ffill().bfill()
         if train.isna().any() or not np.isfinite(train.values).all():
             med = float(np.nanmedian(train.values)) if np.isfinite(train.values).any() else 0.0
             train = train.fillna(med)
@@ -479,17 +646,20 @@ if robust_mode:
         max_pq = min(max_pq, 1)
 else:
     if len(train) < int(min_train_months):
-        st.error(f"El conjunto de entrenamiento es demasiado corto (<{int(min_train_months)} meses). Ajusta la ventana o habilita Modo robusto.")
-        st.stop()
-    if train.isna().any() or not np.isfinite(train.values).all():
-        st.error('El conjunto de entrenamiento contiene valores NaN/Inf. Habilita Modo robusto o ajusta la limpieza/ventana.')
+        st.error(f"Train demasiado corto (<{int(min_train_months)} meses). Ajusta ventana o habilita Modo robusto.")
         st.stop()
 
+# ---- Entrenamiento / selección ----
 st.subheader("Búsqueda y selección de modelos")
 with st.spinner("Entrenando ARIMA / SARIMA / SARIMAX..."):
-    out = grid_search_models(train, test, seasonal_period=int(seasonal_period),
-                             max_pq=int(max_pq), K_fourier=range(K_min, K_max+1),
-                             mape_threshold=float(mape_thr), enforce_threshold=bool(enforce_thr))
+    out = grid_search_models(
+        train, test,
+        seasonal_period=int(seasonal_period),
+        max_pq=int(max_pq),
+        exog_train=X_train, exog_test=X_test,
+        include_fourier=bool(include_fourier), K_fourier=range(K_min, K_max+1),
+        mape_threshold=float(mape_thr), enforce_threshold=bool(enforce_thr)
+    )
 
 if out["best"] is None or len(out["summary"]) == 0:
     st.error("No fue posible ajustar modelos válidos. Revisa los datos.")
@@ -505,33 +675,40 @@ st.dataframe(summary_df[display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2
 
 best = out["best"]
 meets = (best.get('mape', 1e9) <= float(mape_thr))
-st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} | exog={best['exog']} | MAPE={best['mape']:.2f}% | Cumple MAPE ≤ {float(mape_thr):.2f}%: {'Sí' if meets else 'No'}")
+
+exog_cols_best = best.get("exog_cols", [])
+fourier_k  = best.get("fourier_k", None)
+st.success(
+    f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} "
+    f"| exog_cols={exog_cols_best} | fourier_k={fourier_k} | MAPE={best['mape']:.2f}% "
+    f"| Cumple MAPE ≤ {float(mape_thr):.2f}%: {'Sí' if meets else 'No'}"
+)
 if best.get("_note"):
     st.warning(best["_note"])
 
-# Pronóstico (con respaldo)
-def forecast_best(best, train, test, seasonal_period):
-    if str(best["model"]).startswith("SARIMAX"):
-        import re as _re
-        m = _re.search(r"K=(\d+)", best["model"])
-        k = int(m.group(1)) if m else 1
-        exog_train = fourier_terms(train.index, period=int(seasonal_period), K=k)
-        exog_test  = fourier_terms(test.index,  period=int(seasonal_period), K=k)
-        res_tmp = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
-                          exog=exog_train, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-        fc = res_tmp.get_forecast(steps=len(test), exog=exog_test).predicted_mean
-        fc.index = test.index
-        return fc
-    else:
-        res_tmp = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
-                          enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-        fc = res_tmp.get_forecast(steps=len(test)).predicted_mean
-        fc.index = test.index
-        return fc
+# Pronóstico (refit de respaldo si hace falta)
+def forecast_best(best, train, test, seasonal_period, exog_train, exog_test):
+    order = tuple(best["order"]); seasonal_order = tuple(best["seasonal_order"])
+    Xtr = exog_train if best.get("exog_cols") else None
+    Xte = exog_test  if best.get("exog_cols") else None
+    k = best.get("fourier_k", None)
+    if k is not None:
+        ft_train = fourier_terms(train.index, period=int(seasonal_period), K=int(k))
+        ft_test  = fourier_terms(test.index,  period=int(seasonal_period), K=int(k))
+        Xtr = ft_train if Xtr is None else pd.concat([Xtr, ft_train], axis=1)
+        Xte = ft_test  if Xte is None else pd.concat([Xte, ft_test], axis=1)
+    res_tmp = SARIMAX(train, order=order, seasonal_order=seasonal_order,
+                      exog=Xtr, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    fc = res_tmp.get_forecast(steps=len(test), exog=Xte).predicted_mean
+    fc.index = test.index
+    return fc
 
-fc = find_forecast_series(summary_df, best)
-if fc is None:
-    fc = forecast_best(best, train, test, int(seasonal_period))
+try:
+    fc = best.get("forecast", None)
+    if fc is None or len(fc) != len(test):
+        fc = forecast_best(best, train, test, int(seasonal_period), X_train, X_test)
+except Exception:
+    fc = forecast_best(best, train, test, int(seasonal_period), X_train, X_test)
 
 st.markdown("### Pronóstico vs. Real (ventana de evaluación)")
 plot_series(train, test, fc, "Pronóstico sobre la muestra de evaluación")
@@ -543,16 +720,17 @@ st.write({
     "ARCH p-value (no heterocedasticidad)": round(float(best["arch_p"]), 4),
 })
 
-resid_best = refit_and_get_resid(best["model"], tuple(best["order"]), tuple(best["seasonal_order"]), train, int(seasonal_period))
+resid_best = refit_and_get_resid(best, train, int(seasonal_period), X_train)
 plot_residuals(resid_best, title_prefix=f"{best['model']}")
 
 with st.expander("SUMMARY del mejor modelo (statsmodels)", expanded=False):
     try:
-        res_best = fit_best_model_for_summary(best, train, int(seasonal_period))
+        res_best = fit_best_model_for_summary(best, train, int(seasonal_period), X_train)
         st.text(res_best.summary().as_text())
     except Exception as e:
         st.warning(f"No se pudo generar el SUMMARY del mejor modelo: {e}")
 
+# ---- Exportar ----
 st.markdown("### Exportar resultados")
 meets_json = (best.get('mape', 1e9) <= float(mape_thr))
 export = {
@@ -560,7 +738,8 @@ export = {
         "model": best["model"],
         "order": tuple(best["order"]),
         "seasonal_order": tuple(best["seasonal_order"]),
-        "exog": best["exog"],
+        "exog_cols": exog_cols_best,
+        "fourier_k": int(fourier_k) if fourier_k is not None else None,
         "aic": float(best["aic"]),
         "mape_eval_%": float(best["mape"]),
         "meets_mape_threshold": bool(meets_json),
@@ -572,6 +751,14 @@ export = {
         }
     },
     "evaluation_window": {"test_start": str(test.index.min()), "test_end": str(test.index.max())},
+    "exog_build": {
+        "mode": exog_mode,
+        "selected_cols": (list(exog_lags_map.keys()) if exog_lags_map else (exog_cols_user if exog_mode=='Manual' else [])),
+        "selected_lags_map": exog_lags_map,
+        "standardize": bool(exog_standardize),
+        "include_fourier": bool(include_fourier),
+        "fourier_range": [int(K_min), int(K_max)]
+    }
 }
 
 json_bytes = io.BytesIO()
