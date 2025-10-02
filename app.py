@@ -276,218 +276,6 @@ def plot_series(train, test, fc, title):
 
 def plot_residuals(resid, title_prefix=""):
 
-def fit_best_model_for_summary(best: dict, train: pd.Series, seasonal_period: int):
-    \"\"\"Refit the best model on the training set and return the fitted results for .summary().\"\"\"
-    if best["model"].startswith("SARIMAX"):
-        import re as _re
-        k = int(_re.search(r"K=(\d+)", best["model"]).group(1))
-        exog_train = fourier_terms(train.index, period=seasonal_period, K=k)
-        res = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
-                      exog=exog_train, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-    else:
-        res = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
-                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-    return res
-
-    # Residual time plot
-    fig, ax = plt.subplots(figsize=(10,3))
-    resid.plot(ax=ax)
-    ax.set_title(f"{title_prefix} Residuals over time")
-    st.pyplot(fig)
-
-    # Histogram + QQ
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.hist(resid, bins=20, alpha=0.7)
-    ax.set_title(f"{title_prefix} Residuals Histogram")
-    st.pyplot(fig)
-
-    fig = plt.figure(figsize=(6,3))
-    stats.probplot(resid, dist="norm", plot=plt)
-    plt.title(f"{title_prefix} Q-Q plot")
-    st.pyplot(fig)
-
-    # ACF/PACF
-    fig_acf = plt.figure(figsize=(6,3))
-    plot_acf(resid, lags=min(24, len(resid)//2), ax=plt.gca())
-    plt.title(f"{title_prefix} Residuals ACF")
-    st.pyplot(fig_acf)
-
-    fig_pacf = plt.figure(figsize=(6,3))
-    plot_pacf(resid, lags=min(24, len(resid)//2), ax=plt.gca(), method="ywm")
-    plt.title(f"{title_prefix} Residuals PACF")
-    st.pyplot(fig_pacf)
-
-# ----------------------------
-# UI
-# ----------------------------
-
-st.title("Modelado del Grano de Soya: ARIMA vs SARIMA vs SARIMAX")
-st.caption("Criterios: normalidad, no autocorrelación, no heterocedasticidad y MAPE mínimo en la evaluación (2023-01 a 2025-05).")
-
-with st.sidebar:
-    st.header("Datos")
-    default_path = "/mnt/data/soya_limpio_ddmmyyyy.csv"
-    uploaded = st.file_uploader("Sube el CSV", type=["csv"])
-    path = st.text_input("o ruta del CSV", value=default_path)
-    eval_start = st.text_input("Inicio evaluación (YYYY-MM-DD)", value="2023-01-01")
-    eval_end   = st.text_input("Fin evaluación (YYYY-MM-DD)", value="2025-05-31")
-    max_pq = st.slider("Máx p y q", 1, 5, 3)
-    seasonal_period = st.number_input("Periodo estacional (m)", min_value=4, max_value=24, value=12)
-    K_min, K_max = st.slider("Fourier K (SARIMAX)", 1, 6, (1,3))
-
-
-st.header("Limpieza de datos")
-do_winsor = st.checkbox("Capar outliers (winsorizar)", value=True, help="Recorta en percentiles bajos/altos para estabilizar valores extremos.")
-q_low, q_high = st.slider("Percentiles de capping", 0.0, 0.2, (0.01, 0.99))
-do_interp = st.checkbox("Interpolar huecos (lineal)", value=True)
-interp_method = st.selectbox("Método de interpolación", ["linear","time","nearest","polynomial"], index=0)
-do_ffill = st.checkbox("Relleno hacia adelante (ffill)", value=True)
-do_bfill = st.checkbox("Relleno hacia atrás (bfill)", value=True)
-log_mode = st.selectbox("Transformación", ["none","log","log1p"], index=0, help="Usa 'log' si todos los valores son >0. 'log1p' si pueden ser cercanos a 0 (no negativos).")
-
-robust_mode = st.checkbox("Modo robusto (auto-sanar)", value=True, help="Garantiza que el conjunto de entrenamiento no tenga NaN/Inf y sea utilizable. Aplica fijaciones adicionales automáticamente.")
-min_train_months = st.number_input("Mínimo meses en Train", min_value=6, max_value=48, value=12, help="Si hay menos meses, la app degradará la búsqueda (p, q más pequeños) en lugar de fallar.")
-
-st.header("Criterio MAPE")
-mape_thr = st.number_input("Umbral MAPE objetivo (%)", min_value=0.1, max_value=50.0, value=4.0, step=0.1)
-enforce_thr = st.checkbox("Exigir umbral MAPE (descartar modelos que no lo cumplan)", value=True)
-
-
-
-
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-else:
-    if not Path(path).exists():
-        st.error(f"No se encontró el archivo: {path}")
-        st.stop()
-    df = pd.read_csv(path)
-
-st.subheader("Vista previa de datos")
-st.dataframe(df.head(10))
-
-date_col = find_date_col(df)
-if date_col is None:
-    st.error("No se pudo detectar la columna de fecha. Por favor, selecciona una columna válida llamada por ejemplo 'fecha' o 'date'.")
-    st.stop()
-
-# Parse dates
-df[date_col] = try_parse_dates(df[date_col])
-df = df.dropna(subset=[date_col]).sort_values(date_col)
-df = df.set_index(date_col)
-
-# Target detection
-target_candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-target = target_candidates[0] if len(target_candidates) else None
-if target is None:
-    st.error("No se encontró una columna numérica para modelar (precio).")
-    st.stop()
-
-st.write(f"**Fecha:** `{date_col}` | **Objetivo:** `{target}`")
-
-
-series_raw = df[target].astype(float)
-series, clean_report, masks = clean_pipeline(series_raw, do_winsor, q_low, q_high, do_interp, interp_method, do_ffill, do_bfill, log_mode)
-
-with st.expander("Reporte de limpieza", expanded=False):
-    st.write({
-        "NA iniciales": clean_report["initial_na"],
-        "Winsor aplicado": clean_report["winsor_applied"],
-        "NA después de interpolar/ffill/bfill": clean_report["after_fill_na"],
-        "Transformación": clean_report["transform"],
-        "NA finales": clean_report["final_na"],
-        "Observaciones totales": clean_report["length"]
-    })
-    # Visual auditoría: crudo vs limpio
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(10,3))
-    ensure_monthly(series_raw).plot(ax=ax, label="Crudo (mensualizado)")
-    ensure_monthly(series).plot(ax=ax, label="Limpio (mensualizado)")
-    ax.set_title("Validación de limpieza")
-    ax.legend()
-    st.pyplot(fig)
-    # Marcar puntos intervenidos (en índice original)
-    interventions = pd.DataFrame({
-        "capped": masks["capped"],
-        "interp": masks["interp"],
-        "ffill": masks["ffill"],
-        "bfill": masks["bfill"],
-    })
-    st.write("Matriz de intervenciones (True=aplicado):")
-    st.dataframe(interventions[interventions.any(axis=1)])
-
-
-# Asegurar que no queden NaN después de la limpieza
-series = series.dropna()
-train, test = train_test_split_monthly(series, eval_start=eval_start, eval_end=eval_end)
-
-
-if len(train) < 36 or len(test) < 3:
-    st.warning("El conjunto de train o test es demasiado corto para una evaluación robusta. Verifica los rangos de fechas.")
-st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
-# Auto-sanar si es necesario
-if robust_mode:
-    # Si quedan NaN/Inf tras limpieza, aplicar reforzado y garantizar finitud
-    if train.isna().any() or not np.isfinite(train.values).all():
-        train = train.replace([np.inf, -np.inf], np.nan)
-        # Intento de interpolación reforzada
-        train = train.interpolate(method="time").interpolate(method="linear").ffill().bfill()
-        if train.isna().any() or not np.isfinite(train.values).all():
-            # Último recurso: rellenar con la mediana
-            med = float(np.nanmedian(train.values)) if np.isfinite(train.values).any() else 0.0
-            train = train.fillna(med)
-    # Si Train quedó demasiado corto, degradar la búsqueda sin parar
-    if len(train) < int(min_train_months):
-        st.warning(f"Train corto ({len(train)} meses). Se reduce la búsqueda (p,q<=1) y D in {0,1}.")
-        max_pq = min(max_pq, 1)
-else:
-    if len(train) < int(min_train_months):
-        st.error(f'El conjunto de entrenamiento es demasiado corto (<{int(min_train_months)} meses). Ajusta la ventana o habilita Modo robusto.')
-        st.stop()
-    if train.isna().any() or not np.isfinite(train.values).all():
-        st.error('El conjunto de entrenamiento contiene valores NaN/Inf. Habilita Modo robusto o ajusta la limpieza/ventana.')
-        st.stop()
-
-# Decomposition (optional visualization)
-with st.expander("Descomposición STL (sobre la serie mensual)", expanded=False):
-    s_monthly = ensure_monthly(series)
-    stl = STL(s_monthly, period=int(seasonal_period), robust=True).fit()
-    fig, axs = plt.subplots(4,1, figsize=(10,8), sharex=True)
-    axs[0].plot(stl.observed); axs[0].set_title("Observado")
-    axs[1].plot(stl.trend); axs[1].set_title("Tendencia")
-    axs[2].plot(stl.seasonal); axs[2].set_title("Estacional")
-    axs[3].plot(stl.resid); axs[3].set_title("Residuo")
-    st.pyplot(fig)
-
-st.subheader("Búsqueda y selección de modelos")
-with st.spinner("Entrenando ARIMA / SARIMA / SARIMAX..."):
-    out = grid_search_models(train, test, seasonal_period=int(seasonal_period), max_pq=int(max_pq), K_fourier=range(K_min, K_max+1), mape_threshold=float(mape_thr), enforce_threshold=bool(enforce_thr))
-
-if out["best"] is None or len(out["summary"]) == 0:
-    st.error("No fue posible ajustar modelos válidos. Revisa los datos.")
-    st.stop()
-
-st.markdown("### Ranking de modelos")
-display_cols = ["model", "order", "seasonal_order", "exog", "aic", "mape", "jb_p", "lb_p", "arch_p", "passes_all", "meets_thresh"]
-summary_df = out["summary"].copy()
-if isinstance(summary_df, pd.DataFrame):
-    # Ensure all expected columns exist to avoid KeyError
-    for c in display_cols:
-        if c not in summary_df.columns:
-            summary_df[c] = np.nan
-    st.dataframe(summary_df[display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"}))
-else:
-    st.error("No hay resultados para mostrar en el ranking.")
-
-
-best = out["best"]
-meets = (best.get('mape', 1e9) <= float(mape_thr))
-st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} | exog={best['exog']} | MAPE={best['mape']:.2f}% | Cumple MAPE ≤ {float(mape_thr):.2f}%: {'Sí' if meets else 'No'}")
-if best.get('_note'):
-    st.warning(best['_note'])
-
-# Refit best to full train for plotting and diagnostics
-# Retrieve forecast series from the summary table row matching 'best'
 def find_forecast_series(summary_df, best_dict):
     mask = (summary_df["model"]==best_dict["model"]) & \
            (summary_df["order"]==tuple(best_dict["order"])) & \
@@ -530,10 +318,45 @@ def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_perio
 resid_best = refit_and_get_resid(best["model"], tuple(best["order"]), tuple(best["seasonal_order"]), train, int(seasonal_period), best["exog"])
 plot_residuals(resid_best, title_prefix=f"{best['model']}")
 
+
+def fit_best_model_for_summary(best: dict, train: pd.Series, seasonal_period: int):
+    """Refit del mejor modelo sobre el conjunto de entrenamiento para obtener .summary()."""
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    import re as _re
+
+    model_name = str(best.get("model", ""))
+    order = tuple(best.get("order", (0, 0, 0)))
+    seasonal_order = tuple(best.get("seasonal_order", (0, 0, 0, 0)))
+
+    if model_name.startswith("SARIMAX"):
+        m = _re.search(r"K=(\d+)", model_name)
+        k = int(m.group(1)) if m else 1
+        exog_train = fourier_terms(train.index, period=int(seasonal_period), K=k)
+        res = SARIMAX(
+            train,
+            order=order,
+            seasonal_order=seasonal_order,
+            exog=exog_train,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+    else:
+        res = SARIMAX(
+            train,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+    return res
+
 with st.expander("SUMMARY del mejor modelo (statsmodels)", expanded=False):
     try:
         res_best = fit_best_model_for_summary(best, train, int(seasonal_period))
-        st.text(res_best.summary().as_text())
+        if res_best is not None:
+            st.text(res_best.summary().as_text())
+        else:
+            st.warning("No se pudo generar el SUMMARY del mejor modelo (res_best=None).")
     except Exception as e:
         st.warning(f"No se pudo generar el SUMMARY del mejor modelo: {e}")
 
