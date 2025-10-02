@@ -22,15 +22,19 @@ import warnings
 def replace_nonfinite(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-def winsorize_series(s: pd.Series, low_q=0.01, high_q=0.99) -> pd.Series:
+def winsorize_series(s: pd.Series, low_q=0.01, high_q=0.99):
     s_clean = s.copy()
     lo = s_clean.quantile(low_q)
     hi = s_clean.quantile(high_q)
-    return s_clean.clip(lower=lo, upper=hi)
+    capped = (s_clean < lo) | (s_clean > hi)
+    return s_clean.clip(lower=lo, upper=hi), capped
 
-def interpolate_series(s: pd.Series, method="linear") -> pd.Series:
-    # Interpolate inside gaps; still allow outer NaNs to be filled with ffill/bfill later
-    return s.interpolate(method=method, limit_direction="both")
+def interpolate_series(s: pd.Series, method="linear"):
+    before = s.isna()
+    s2 = s.interpolate(method=method, limit_direction="both")
+    after = s2.isna()
+    filled = before & (~after)
+    return s2, filled
 
 def apply_log(s: pd.Series, mode="none"):
     if mode == "none":
@@ -50,24 +54,33 @@ def clean_pipeline(s: pd.Series, do_winsor=True, q_low=0.01, q_high=0.99,
                    log_mode="none"):
     report = {}
 
-    orig_len = len(s)
     s0 = replace_nonfinite(s)
     report["initial_na"] = int(s0.isna().sum())
 
     if do_winsor:
-        s1 = winsorize_series(s0, q_low, q_high)
+        s1, capped_mask = winsorize_series(s0, q_low, q_high)
     else:
-        s1 = s0.copy()
+        s1, capped_mask = s0.copy(), pd.Series(False, index=s0.index)
     report["winsor_applied"] = bool(do_winsor)
 
     if do_interp:
-        s2 = interpolate_series(s1, interp_method)
+        s2, interp_mask = interpolate_series(s1, interp_method)
     else:
-        s2 = s1.copy()
+        s2, interp_mask = s1.copy(), pd.Series(False, index=s1.index)
+
     if do_ffill:
+        pre_ffill_na = s2.isna()
         s2 = s2.ffill()
+        ffill_mask = pre_ffill_na & (~s2.isna())
+    else:
+        ffill_mask = pd.Series(False, index=s2.index)
+
     if do_bfill:
+        pre_bfill_na = s2.isna()
         s2 = s2.bfill()
+        bfill_mask = pre_bfill_na & (~s2.isna())
+    else:
+        bfill_mask = pd.Series(False, index=s2.index)
 
     report["after_fill_na"] = int(s2.isna().sum())
 
@@ -76,7 +89,8 @@ def clean_pipeline(s: pd.Series, do_winsor=True, q_low=0.01, q_high=0.99,
     report["final_na"] = int(s3.isna().sum())
     report["length"] = int(len(s3))
 
-    return s3, report
+    masks = {"capped": capped_mask, "interp": interp_mask, "ffill": ffill_mask, "bfill": bfill_mask}
+    return s3, report, masks
 
 
 st.set_page_config(page_title="Soya ARIMA/SARIMA/SARIMAX Selector", layout="wide")
@@ -191,7 +205,7 @@ def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
         "forecast": fc
     }
 
-def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, max_pq=3, K_fourier=(1,2,3)) -> Dict[str, Any]:
+def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, max_pq=3, K_fourier=(1,2,3), mape_threshold=None, enforce_threshold=False) -> Dict[str, Any]:
     results = []
 
     d = select_differencing(train)
@@ -317,6 +331,15 @@ do_ffill = st.checkbox("Relleno hacia adelante (ffill)", value=True)
 do_bfill = st.checkbox("Relleno hacia atrás (bfill)", value=True)
 log_mode = st.selectbox("Transformación", ["none","log","log1p"], index=0, help="Usa 'log' si todos los valores son >0. 'log1p' si pueden ser cercanos a 0 (no negativos).")
 
+robust_mode = st.checkbox("Modo robusto (auto-sanar)", value=True, help="Garantiza que el conjunto de entrenamiento no tenga NaN/Inf y sea utilizable. Aplica fijaciones adicionales automáticamente.")
+min_train_months = st.number_input("Mínimo meses en Train", min_value=6, max_value=48, value=12, help="Si hay menos meses, la app degradará la búsqueda (p, q más pequeños) en lugar de fallar.")
+
+st.header("Criterio MAPE")
+mape_thr = st.number_input("Umbral MAPE objetivo (%)", min_value=0.1, max_value=50.0, value=4.0, step=0.1)
+enforce_thr = st.checkbox("Exigir umbral MAPE (descartar modelos que no lo cumplan)", value=True)
+
+
+
 
 if uploaded is not None:
     df = pd.read_csv(uploaded)
@@ -350,7 +373,7 @@ st.write(f"**Fecha:** `{date_col}` | **Objetivo:** `{target}`")
 
 
 series_raw = df[target].astype(float)
-series, clean_report = clean_pipeline(series_raw, do_winsor, q_low, q_high, do_interp, interp_method, do_ffill, do_bfill, log_mode)
+series, clean_report, masks = clean_pipeline(series_raw, do_winsor, q_low, q_high, do_interp, interp_method, do_ffill, do_bfill, log_mode)
 
 with st.expander("Reporte de limpieza", expanded=False):
     st.write({
@@ -361,6 +384,23 @@ with st.expander("Reporte de limpieza", expanded=False):
         "NA finales": clean_report["final_na"],
         "Observaciones totales": clean_report["length"]
     })
+    # Visual auditoría: crudo vs limpio
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10,3))
+    ensure_monthly(series_raw).plot(ax=ax, label="Crudo (mensualizado)")
+    ensure_monthly(series).plot(ax=ax, label="Limpio (mensualizado)")
+    ax.set_title("Validación de limpieza")
+    ax.legend()
+    st.pyplot(fig)
+    # Marcar puntos intervenidos (en índice original)
+    interventions = pd.DataFrame({
+        "capped": masks["capped"],
+        "interp": masks["interp"],
+        "ffill": masks["ffill"],
+        "bfill": masks["bfill"],
+    })
+    st.write("Matriz de intervenciones (True=aplicado):")
+    st.dataframe(interventions[interventions.any(axis=1)])
 
 
 # Asegurar que no queden NaN después de la limpieza
@@ -371,12 +411,28 @@ train, test = train_test_split_monthly(series, eval_start=eval_start, eval_end=e
 if len(train) < 36 or len(test) < 3:
     st.warning("El conjunto de train o test es demasiado corto para una evaluación robusta. Verifica los rangos de fechas.")
 st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
-if len(train) < 12:
-    st.error('El conjunto de entrenamiento es demasiado corto (<12 meses) para una búsqueda de modelos fiable. Revisa tu ventana de evaluación o aporta más historial.')
-    st.stop()
-if train.isna().any() or not np.isfinite(train.values).all():
-    st.error('El conjunto de entrenamiento contiene valores NaN/Inf. Limpia los datos o ajusta la ventana.')
-    st.stop()
+# Auto-sanar si es necesario
+if robust_mode:
+    # Si quedan NaN/Inf tras limpieza, aplicar reforzado y garantizar finitud
+    if train.isna().any() or not np.isfinite(train.values).all():
+        train = train.replace([np.inf, -np.inf], np.nan)
+        # Intento de interpolación reforzada
+        train = train.interpolate(method="time").interpolate(method="linear").ffill().bfill()
+        if train.isna().any() or not np.isfinite(train.values).all():
+            # Último recurso: rellenar con la mediana
+            med = float(np.nanmedian(train.values)) if np.isfinite(train.values).any() else 0.0
+            train = train.fillna(med)
+    # Si Train quedó demasiado corto, degradar la búsqueda sin parar
+    if len(train) < int(min_train_months):
+        st.warning(f"Train corto ({len(train)} meses). Se reduce la búsqueda (p,q<=1) y D in {0,1}.")
+        max_pq = min(max_pq, 1)
+else:
+    if len(train) < int(min_train_months):
+        st.error(f'El conjunto de entrenamiento es demasiado corto (<{int(min_train_months)} meses). Ajusta la ventana o habilita Modo robusto.')
+        st.stop()
+    if train.isna().any() or not np.isfinite(train.values).all():
+        st.error('El conjunto de entrenamiento contiene valores NaN/Inf. Habilita Modo robusto o ajusta la limpieza/ventana.')
+        st.stop()
 
 # Decomposition (optional visualization)
 with st.expander("Descomposición STL (sobre la serie mensual)", expanded=False):
@@ -391,18 +447,21 @@ with st.expander("Descomposición STL (sobre la serie mensual)", expanded=False)
 
 st.subheader("Búsqueda y selección de modelos")
 with st.spinner("Entrenando ARIMA / SARIMA / SARIMAX..."):
-    out = grid_search_models(train, test, seasonal_period=int(seasonal_period), max_pq=int(max_pq), K_fourier=range(K_min, K_max+1))
+    out = grid_search_models(train, test, seasonal_period=int(seasonal_period), max_pq=int(max_pq), K_fourier=range(K_min, K_max+1), mape_threshold=float(mape_thr), enforce_threshold=bool(enforce_thr))
 
 if out["best"] is None or len(out["summary"]) == 0:
     st.error("No fue posible ajustar modelos válidos. Revisa los datos.")
     st.stop()
 
 st.markdown("### Ranking de modelos")
-display_cols = ["model", "order", "seasonal_order", "exog", "aic", "mape", "jb_p", "lb_p", "arch_p"]
+display_cols = ["model", "order", "seasonal_order", "exog", "aic", "mape", "jb_p", "lb_p", "arch_p", "passes_all", "meets_thresh"]
 st.dataframe(out["summary"][display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"}))
 
 best = out["best"]
-st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} | exog={best['exog']} | MAPE={best['mape']:.2f}%")
+meets = (best.get('mape', 1e9) <= float(mape_thr))
+st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} | exog={best['exog']} | MAPE={best['mape']:.2f}% | Cumple MAPE ≤ {float(mape_thr):.2f}%: {'Sí' if meets else 'No'}")
+if best.get('_note'):
+    st.warning(best['_note'])
 
 # Refit best to full train for plotting and diagnostics
 # Retrieve forecast series from the summary table row matching 'best'
