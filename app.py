@@ -89,14 +89,19 @@ def select_differencing(y: pd.Series) -> int:
     adf_p = adfuller(y.dropna(), autolag="AIC")[1]
     return 1 if adf_p > 0.05 else 0
 
+
 def diagnostics(res, y, exog=None) -> Dict[str, float]:
     resid = res.resid.dropna()
+    # Defino lags de forma robusta al tamaño de la muestra
+    lb_lags = min(24, max(2, int(np.sqrt(len(resid)))))
+    arch_lags = min(12, max(2, int(np.sqrt(len(resid)) // 2)))
     return {
         "jb_p": jb_pvalue(resid),
-        "lb_p": ljungbox_pvalue(resid, lags=min(24, max(2, int(np.sqrt(len(resid)))))),
-        "arch_p": arch_pvalue(resid, lags=min(12, max(2, int(np.sqrt(len(resid))/2))))),
+        "lb_p": ljungbox_pvalue(resid, lags=lb_lags),
+        "arch_p": arch_pvalue(resid, lags=arch_lags),
         "resid": resid
     }
+
 
 def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
     return {
