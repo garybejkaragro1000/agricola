@@ -275,6 +275,20 @@ def plot_series(train, test, fc, title):
     st.pyplot(fig)
 
 def plot_residuals(resid, title_prefix=""):
+
+def fit_best_model_for_summary(best: dict, train: pd.Series, seasonal_period: int):
+    \"\"\"Refit the best model on the training set and return the fitted results for .summary().\"\"\"
+    if best["model"].startswith("SARIMAX"):
+        import re as _re
+        k = int(_re.search(r"K=(\d+)", best["model"]).group(1))
+        exog_train = fourier_terms(train.index, period=seasonal_period, K=k)
+        res = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
+                      exog=exog_train, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    else:
+        res = SARIMAX(train, order=tuple(best["order"]), seasonal_order=tuple(best["seasonal_order"]),
+                      enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    return res
+
     # Residual time plot
     fig, ax = plt.subplots(figsize=(10,3))
     resid.plot(ax=ax)
@@ -516,8 +530,17 @@ def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_perio
 resid_best = refit_and_get_resid(best["model"], tuple(best["order"]), tuple(best["seasonal_order"]), train, int(seasonal_period), best["exog"])
 plot_residuals(resid_best, title_prefix=f"{best['model']}")
 
+with st.expander("SUMMARY del mejor modelo (statsmodels)", expanded=False):
+    try:
+        res_best = fit_best_model_for_summary(best, train, int(seasonal_period))
+        st.text(res_best.summary().as_text())
+    except Exception as e:
+        st.warning(f"No se pudo generar el SUMMARY del mejor modelo: {e}")
+
+
 # Export results
 st.markdown("### Exportar resultados")
+meets_json = (best.get('mape', 1e9) <= float(mape_thr))
 export = {
     "best_model": {
         "model": best["model"],
@@ -526,6 +549,8 @@ export = {
         "exog": best["exog"],
         "aic": float(best["aic"]),
         "mape_eval_%": float(best["mape"]),
+        "meets_mape_threshold": bool(meets_json),
+        "note": best.get("_note"),
         "diagnostics_pvalues": {
             "jarque_bera": float(best["jb_p"]),
             "ljung_box": float(best["lb_p"]),
