@@ -455,7 +455,16 @@ if out["best"] is None or len(out["summary"]) == 0:
 
 st.markdown("### Ranking de modelos")
 display_cols = ["model", "order", "seasonal_order", "exog", "aic", "mape", "jb_p", "lb_p", "arch_p", "passes_all", "meets_thresh"]
-st.dataframe(out["summary"][display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"}))
+summary_df = out["summary"].copy()
+if isinstance(summary_df, pd.DataFrame):
+    # Ensure all expected columns exist to avoid KeyError
+    for c in display_cols:
+        if c not in summary_df.columns:
+            summary_df[c] = np.nan
+    st.dataframe(summary_df[display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"}))
+else:
+    st.error("No hay resultados para mostrar en el ranking.")
+
 
 best = out["best"]
 meets = (best.get('mape', 1e9) <= float(mape_thr))
@@ -470,8 +479,12 @@ def find_forecast_series(summary_df, best_dict):
            (summary_df["order"]==tuple(best_dict["order"])) & \
            (summary_df["seasonal_order"]==tuple(best_dict["seasonal_order"])) & \
            (summary_df["mape"]==best_dict["mape"])
-    row = summary_df[mask].iloc[0]
-    return row["forecast"]
+    subset = summary_df[mask]
+    if len(subset)==0:
+        # fallback: take the first row
+        subset = summary_df.iloc[[0]]
+    row = subset.iloc[0]
+    return row.get("forecast")
 
 fc = find_forecast_series(out["summary"], best)
 
