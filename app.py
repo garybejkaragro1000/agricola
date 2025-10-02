@@ -565,8 +565,19 @@ with st.sidebar:
     include_fourier = st.checkbox("Añadir Fourier a SARIMAX", value=True,
                                   help="Si no se usan exógenas, SARIMAX probará Fourier solo. Si hay exógenas, probará exógenas+Fourier.")
 
+    st.header("Faltantes en exógenas (test)")
+    exog_missing_policy = st.selectbox(
+        "Política ante faltantes/extrapolación",
+        [
+            "Permitir extrapolación (interpolar/ffill/bfill)",
+            "No extrapolar: degradar a sin exógenas",
+            "No extrapolar: fallar si faltan"
+        ],
+        index=0
+    )
+
     st.header("Robustez")
-    robust_mode = st.checkbox("Modo robusto (auto-sanar)", value=True)
+    robust_mode = st.checkbox("Modo robusto (auto-sanar target/exógenas)", value=True)
     min_train_months = st.number_input("Mínimo meses en Train", min_value=6, max_value=48, value=12)
 
     st.header("Criterio MAPE")
@@ -621,23 +632,61 @@ elif exog_mode == "Manual" and len(exog_cols_user) > 0:
         standardize=exog_standardize
     )
 
+# --- Alinear exógenas al índice completo del objetivo (train+test) para evitar KeyError ---
 if X_all is not None:
-    if robust_mode and (X_all.isna().any().any() or not np.isfinite(X_all.values).all()):
-        X_all = X_all.replace([np.inf, -np.inf], np.nan).interpolate(method="time").interpolate(method="linear").ffill().bfill()
-        if X_all.isna().any().any():
-            X_all = X_all.fillna(X_all.median())
+    X_all = ensure_monthly_df(X_all).reindex(series.index)
 
+    # Detectar problemas por separado en train y test
+    def _has_issues(df_):
+        return (df_.isna().any().any()) or (not np.isfinite(df_.values).all())
+
+    issues_train = _has_issues(X_all.loc[train.index])
+    issues_test  = _has_issues(X_all.loc[test.index])
+
+    policy = exog_missing_policy
+    degraded = False
+
+    if policy == "Permitir extrapolación (interpolar/ffill/bfill)":
+        if issues_train or issues_test:
+            X_all = (X_all.replace([np.inf, -np.inf], np.nan)
+                           .interpolate(method="time")
+                           .interpolate(method="linear")
+                           .ffill()
+                           .bfill())
+            # Si aún quedan NaN, medianas por columna
+            if _has_issues(X_all.loc[train.index]) or _has_issues(X_all.loc[test.index]):
+                X_all = X_all.fillna(X_all.median())
+    elif policy == "No extrapolar: degradar a sin exógenas":
+        if issues_train or issues_test:
+            st.warning("Faltan valores en exógenas en train o test y se seleccionó **No extrapolar (degradar)**. "
+                       "Se continuará **sin exógenas**. Fourier se mantiene si está activado.")
+            X_all = None
+            exog_lags_map = {}
+            degraded = True
+    elif policy == "No extrapolar: fallar si faltan":
+        if issues_train or issues_test:
+            st.error("Faltan valores en exógenas en train o test y se seleccionó **No extrapolar (fallar)**. "
+                     "Ajusta la política o corrige la cobertura de exógenas.")
+            st.stop()
+
+# Split exógenas
 X_train = X_all.loc[train.index] if X_all is not None else None
 X_test  = X_all.loc[test.index]  if X_all is not None else None
 
 st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
-if exog_lags_map:
+if exog_lags_map and X_all is not None:
     st.info(f"Lags seleccionados automáticamente: {exog_lags_map}")
+elif exog_mode != "Ninguna" and X_all is None and policy != "No extrapolar: fallar si faltan":
+    st.info("No se usarán exógenas (se degradó por política de no extrapolación).")
 
-# Auto-sanar train si hace falta
+# Auto-sanar target si hace falta
 if robust_mode:
     if train.isna().any() or not np.isfinite(train.values).all():
-        train = train.replace([np.inf, -np.inf], np.nan).interpolate(method="time").interpolate(method="linear").ffill().bfill()
+        train = (train.replace([np.inf, -np.inf], np.nan)
+                      .interpolate(method="time")
+                      .interpolate(method="linear")
+                      .ffill()
+                      .bfill())
         if train.isna().any() or not np.isfinite(train.values).all():
             med = float(np.nanmedian(train.values)) if np.isfinite(train.values).any() else 0.0
             train = train.fillna(med)
@@ -757,7 +806,8 @@ export = {
         "selected_lags_map": exog_lags_map,
         "standardize": bool(exog_standardize),
         "include_fourier": bool(include_fourier),
-        "fourier_range": [int(K_min), int(K_max)]
+        "fourier_range": [int(K_min), int(K_max)],
+        "missing_policy": exog_missing_policy
     }
 }
 
