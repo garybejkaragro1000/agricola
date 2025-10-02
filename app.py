@@ -14,7 +14,70 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from scipy import stats
 import warnings
-warnings.filterwarnings("ignore")
+
+# ----------------------------
+# Cleaning helpers
+# ----------------------------
+
+def replace_nonfinite(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+def winsorize_series(s: pd.Series, low_q=0.01, high_q=0.99) -> pd.Series:
+    s_clean = s.copy()
+    lo = s_clean.quantile(low_q)
+    hi = s_clean.quantile(high_q)
+    return s_clean.clip(lower=lo, upper=hi)
+
+def interpolate_series(s: pd.Series, method="linear") -> pd.Series:
+    # Interpolate inside gaps; still allow outer NaNs to be filled with ffill/bfill later
+    return s.interpolate(method=method, limit_direction="both")
+
+def apply_log(s: pd.Series, mode="none"):
+    if mode == "none":
+        return s
+    if mode == "log":
+        # require positive values
+        s_pos = s.where(s > 0, np.nan)
+        return np.log(s_pos)
+    if mode == "log1p":
+        s_shift = s.where(s >= -0.999999, np.nan)
+        return np.log1p(s_shift)
+    return s
+
+def clean_pipeline(s: pd.Series, do_winsor=True, q_low=0.01, q_high=0.99,
+                   do_interp=True, interp_method="linear",
+                   do_ffill=True, do_bfill=True,
+                   log_mode="none"):
+    report = {}
+
+    orig_len = len(s)
+    s0 = replace_nonfinite(s)
+    report["initial_na"] = int(s0.isna().sum())
+
+    if do_winsor:
+        s1 = winsorize_series(s0, q_low, q_high)
+    else:
+        s1 = s0.copy()
+    report["winsor_applied"] = bool(do_winsor)
+
+    if do_interp:
+        s2 = interpolate_series(s1, interp_method)
+    else:
+        s2 = s1.copy()
+    if do_ffill:
+        s2 = s2.ffill()
+    if do_bfill:
+        s2 = s2.bfill()
+
+    report["after_fill_na"] = int(s2.isna().sum())
+
+    s3 = apply_log(s2, log_mode)
+    report["transform"] = log_mode
+    report["final_na"] = int(s3.isna().sum())
+    report["length"] = int(len(s3))
+
+    return s3, report
+
 
 st.set_page_config(page_title="Soya ARIMA/SARIMA/SARIMAX Selector", layout="wide")
 
@@ -244,6 +307,17 @@ with st.sidebar:
     seasonal_period = st.number_input("Periodo estacional (m)", min_value=4, max_value=24, value=12)
     K_min, K_max = st.slider("Fourier K (SARIMAX)", 1, 6, (1,3))
 
+
+st.header("Limpieza de datos")
+do_winsor = st.checkbox("Capar outliers (winsorizar)", value=True, help="Recorta en percentiles bajos/altos para estabilizar valores extremos.")
+q_low, q_high = st.slider("Percentiles de capping", 0.0, 0.2, (0.01, 0.99))
+do_interp = st.checkbox("Interpolar huecos (lineal)", value=True)
+interp_method = st.selectbox("Método de interpolación", ["linear","time","nearest","polynomial"], index=0)
+do_ffill = st.checkbox("Relleno hacia adelante (ffill)", value=True)
+do_bfill = st.checkbox("Relleno hacia atrás (bfill)", value=True)
+log_mode = st.selectbox("Transformación", ["none","log","log1p"], index=0, help="Usa 'log' si todos los valores son >0. 'log1p' si pueden ser cercanos a 0 (no negativos).")
+
+
 if uploaded is not None:
     df = pd.read_csv(uploaded)
 else:
@@ -274,8 +348,25 @@ if target is None:
 
 st.write(f"**Fecha:** `{date_col}` | **Objetivo:** `{target}`")
 
-series = df[target].astype(float)
+
+series_raw = df[target].astype(float)
+series, clean_report = clean_pipeline(series_raw, do_winsor, q_low, q_high, do_interp, interp_method, do_ffill, do_bfill, log_mode)
+
+with st.expander("Reporte de limpieza", expanded=False):
+    st.write({
+        "NA iniciales": clean_report["initial_na"],
+        "Winsor aplicado": clean_report["winsor_applied"],
+        "NA después de interpolar/ffill/bfill": clean_report["after_fill_na"],
+        "Transformación": clean_report["transform"],
+        "NA finales": clean_report["final_na"],
+        "Observaciones totales": clean_report["length"]
+    })
+
+
+# Asegurar que no queden NaN después de la limpieza
+series = series.dropna()
 train, test = train_test_split_monthly(series, eval_start=eval_start, eval_end=eval_end)
+
 
 if len(train) < 36 or len(test) < 3:
     st.warning("El conjunto de train o test es demasiado corto para una evaluación robusta. Verifica los rangos de fechas.")
