@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,18 +16,19 @@ from scipy import stats
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Soya: ARIMA/SARIMA/SARIMAX", layout="wide")
+st.set_page_config(page_title="Soya ARIMA/SARIMA/SARIMAX Selector", layout="wide")
 
 # ----------------------------
 # Helpers
 # ----------------------------
 
 def try_parse_dates(s: pd.Series) -> pd.Series:
-    # Acepta dd-mm-yyyy y dd/mm/yyyy; dayfirst=True para tu CSV
+    # Try multiple common formats, force dayfirst
     return pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
 
 def find_date_col(df: pd.DataFrame) -> Optional[str]:
     candidates = [c for c in df.columns if c.lower() in ["fecha", "date", "period", "time", "month", "fecha_mes"]]
+    # If none of the common names, try to parse columns by dtype
     for c in df.columns:
         if c not in candidates:
             try:
@@ -38,13 +40,14 @@ def find_date_col(df: pd.DataFrame) -> Optional[str]:
     return candidates[0] if len(candidates) else None
 
 def ensure_monthly(series: pd.Series) -> pd.Series:
+    # If frequency is daily or irregular, aggregate to month-end mean
     s = series.dropna().sort_index()
-    # Si no es mensual, agrego por fin de mes (mean)
     if s.index.inferred_freq in [None, "D", "B", "W", "QS", "Q", "A", "H", "T", "S"]:
         return s.resample("M").mean().dropna()
-    # Si es mensual pero desalineado, fuerzo frecuencia M
+    # If it's monthly but not aligned to month-end, align
     if s.index.inferred_freq and "M" in s.index.inferred_freq:
         return s.asfreq("M")
+    # Fallback to month-end
     return s.resample("M").mean().dropna()
 
 def train_test_split_monthly(s: pd.Series, eval_start="2023-01-01", eval_end="2025-05-31") -> Tuple[pd.Series, pd.Series]:
@@ -59,8 +62,7 @@ def mape(y_true, y_pred) -> float:
     return np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100.0
 
 def fit_sarimax(y, order, seasonal_order=(0,0,0,0), exog=None):
-    model = SARIMAX(y, order=order, seasonal_order=seasonal_order,
-                    exog=exog, enforce_stationarity=False, enforce_invertibility=False)
+    model = SARIMAX(y, order=order, seasonal_order=seasonal_order, exog=exog, enforce_stationarity=False, enforce_invertibility=False)
     res = model.fit(disp=False)
     return res
 
@@ -77,6 +79,7 @@ def jb_pvalue(residuals):
     return float(jb_p)
 
 def fourier_terms(index, period=12, K=1):
+    # Generate Fourier seasonal terms for SARIMAX exog
     t = np.arange(len(index))
     X = {}
     for k in range(1, K+1):
@@ -85,14 +88,23 @@ def fourier_terms(index, period=12, K=1):
     return pd.DataFrame(X, index=index)
 
 def select_differencing(y: pd.Series) -> int:
-    # ADF: si no estacionaria, d=1 (cap en 1)
-    adf_p = adfuller(y.dropna(), autolag="AIC")[1]
-    return 1 if adf_p > 0.05 else 0
-
+    # Robust ADF: handle short/constant/invalid series gracefully
+    y_clean = pd.Series(y).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(y_clean) < 12:
+        # too short for a reliable unit root test; avoid differencing by default
+        return 0
+    if y_clean.std() == 0 or y_clean.max() == y_clean.min():
+        # constant series -> no differencing
+        return 0
+    try:
+        adf_p = adfuller(y_clean.values, autolag="AIC")[1]
+        return 1 if adf_p > 0.05 else 0
+    except Exception:
+        # fall back safely
+        return 0
 
 def diagnostics(res, y, exog=None) -> Dict[str, float]:
     resid = res.resid.dropna()
-    # Defino lags de forma robusta al tamaño de la muestra
     lb_lags = min(24, max(2, int(np.sqrt(len(resid)))))
     arch_lags = min(12, max(2, int(np.sqrt(len(resid)) // 2)))
     return {
@@ -101,7 +113,6 @@ def diagnostics(res, y, exog=None) -> Dict[str, float]:
         "arch_p": arch_pvalue(resid, lags=arch_lags),
         "resid": resid
     }
-
 
 def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
     return {
@@ -119,9 +130,9 @@ def record_result(kind, order, seasonal_order, exog_desc, test, fc, diag, aic):
 
 def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, max_pq=3, K_fourier=(1,2,3)) -> Dict[str, Any]:
     results = []
-    d = select_differencing(train)
 
-    # ARIMA
+    d = select_differencing(train)
+    # ARIMA (no seasonal)
     for p in range(0, max_pq+1):
         for q in range(0, max_pq+1):
             try:
@@ -130,10 +141,10 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
                 fc.index = test.index
                 diag = diagnostics(res, train)
                 results.append(record_result("ARIMA", (p,d,q), (0,0,0,0), None, test, fc, diag, res.aic))
-            except Exception:
+            except Exception as e:
                 continue
 
-    # SARIMA
+    # SARIMA (seasonal part)
     for p in range(0, max_pq+1):
         for q in range(0, max_pq+1):
             for D in [0,1]:
@@ -146,7 +157,7 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
                 except Exception:
                     continue
 
-    # SARIMAX con términos de Fourier
+    # SARIMAX (with Fourier terms)
     for K in K_fourier:
         exog_train = fourier_terms(train.index, period=seasonal_period, K=K)
         exog_test  = fourier_terms(test.index,  period=seasonal_period, K=K)
@@ -154,18 +165,15 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
             for q in range(0, max_pq+1):
                 for D in [0,1]:
                     try:
-                        res = fit_sarimax(train, order=(p,d,q),
-                                          seasonal_order=(p, D, q, seasonal_period),
-                                          exog=exog_train)
+                        res = fit_sarimax(train, order=(p,d,q), seasonal_order=(p, D, q, seasonal_period), exog=exog_train)
                         fc = res.get_forecast(steps=len(test), exog=exog_test).predicted_mean
                         fc.index = test.index
                         diag = diagnostics(res, train, exog_train)
-                        results.append(record_result(f"SARIMAX(K={K})", (p,d,q),
-                                                     (p,D,q,seasonal_period),
-                                                     f"Fourier K={K}", test, fc, diag, res.aic))
+                        results.append(record_result(f"SARIMAX(K={K})", (p,d,q), (p,D,q,seasonal_period), f"Fourier K={K}", test, fc, diag, res.aic))
                     except Exception:
                         continue
 
+    # Rank: first, filter those that pass all diagnostics; then by MAPE; if none pass, sort by number of passes then MAPE
     df = pd.DataFrame(results)
     if len(df)==0:
         return {"summary": pd.DataFrame(), "best": None}
@@ -177,11 +185,8 @@ def grid_search_models(train: pd.Series, test: pd.Series, seasonal_period=12, ma
     if len(candidates) > 0:
         best_row = candidates.sort_values(["mape", "aic"]).iloc[0].to_dict()
     else:
-        best_row = df.sort_values(["passes_count", "mape", "aic"],
-                                  ascending=[False, True, True]).iloc[0].to_dict()
-    return {"summary": df.sort_values(["passes_all","passes_count","mape","aic"],
-                                      ascending=[False, False, True, True]),
-            "best": best_row}
+        best_row = df.sort_values(["passes_count", "mape", "aic"], ascending=[False, True, True]).iloc[0].to_dict()
+    return {"summary": df.sort_values(["passes_all","passes_count","mape","aic"], ascending=[False, False, True, True]), "best": best_row}
 
 def plot_series(train, test, fc, title):
     fig, ax = plt.subplots(figsize=(10,4))
@@ -199,19 +204,18 @@ def plot_residuals(resid, title_prefix=""):
     ax.set_title(f"{title_prefix} Residuals over time")
     st.pyplot(fig)
 
-    # Histograma
+    # Histogram + QQ
     fig, ax = plt.subplots(figsize=(6,3))
     ax.hist(resid, bins=20, alpha=0.7)
     ax.set_title(f"{title_prefix} Residuals Histogram")
     st.pyplot(fig)
 
-    # QQ
     fig = plt.figure(figsize=(6,3))
     stats.probplot(resid, dist="norm", plot=plt)
     plt.title(f"{title_prefix} Q-Q plot")
     st.pyplot(fig)
 
-    # ACF / PACF
+    # ACF/PACF
     fig_acf = plt.figure(figsize=(6,3))
     plot_acf(resid, lags=min(24, len(resid)//2), ax=plt.gca())
     plt.title(f"{title_prefix} Residuals ACF")
@@ -223,11 +227,11 @@ def plot_residuals(resid, title_prefix=""):
     st.pyplot(fig_pacf)
 
 # ----------------------------
-# UI principal
+# UI
 # ----------------------------
 
 st.title("Modelado del Grano de Soya: ARIMA vs SARIMA vs SARIMAX")
-st.caption("Criterios: normalidad, no autocorrelación, no heterocedasticidad y MAPE mínimo (enero 2023 a mayo 2025).")
+st.caption("Criterios: normalidad, no autocorrelación, no heterocedasticidad y MAPE mínimo en la evaluación (2023-01 a 2025-05).")
 
 with st.sidebar:
     st.header("Datos")
@@ -240,7 +244,6 @@ with st.sidebar:
     seasonal_period = st.number_input("Periodo estacional (m)", min_value=4, max_value=24, value=12)
     K_min, K_max = st.slider("Fourier K (SARIMAX)", 1, 6, (1,3))
 
-# Carga de datos
 if uploaded is not None:
     df = pd.read_csv(uploaded)
 else:
@@ -254,27 +257,38 @@ st.dataframe(df.head(10))
 
 date_col = find_date_col(df)
 if date_col is None:
-    st.error("No se detectó columna de fecha. Usa nombres como 'fecha' o 'date' o selecciona una existente.")
+    st.error("No se pudo detectar la columna de fecha. Por favor, selecciona una columna válida llamada por ejemplo 'fecha' o 'date'.")
     st.stop()
 
+# Parse dates
 df[date_col] = try_parse_dates(df[date_col])
-df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+df = df.dropna(subset=[date_col]).sort_values(date_col)
+df = df.set_index(date_col)
 
-# Detectar objetivo (primera numérica)
-num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-if not num_cols:
-    st.error("No se encontró una columna numérica para modelar (precio objetivo).")
+# Target detection
+target_candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+target = target_candidates[0] if len(target_candidates) else None
+if target is None:
+    st.error("No se encontró una columna numérica para modelar (precio).")
     st.stop()
-target = num_cols[0]
+
 st.write(f"**Fecha:** `{date_col}` | **Objetivo:** `{target}`")
 
 series = df[target].astype(float)
 train, test = train_test_split_monthly(series, eval_start=eval_start, eval_end=eval_end)
-st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
-if len(train) < 36 or len(test) < 3:
-    st.warning("Train o test es corto para una evaluación robusta. Verifica el rango de fechas.")
 
-with st.expander("Descomposición STL (serie mensual)", expanded=False):
+if len(train) < 36 or len(test) < 3:
+    st.warning("El conjunto de train o test es demasiado corto para una evaluación robusta. Verifica los rangos de fechas.")
+st.write(f"Observaciones: Train={len(train)}, Test={len(test)}")
+if len(train) < 12:
+    st.error('El conjunto de entrenamiento es demasiado corto (<12 meses) para una búsqueda de modelos fiable. Revisa tu ventana de evaluación o aporta más historial.')
+    st.stop()
+if train.isna().any() or not np.isfinite(train.values).all():
+    st.error('El conjunto de entrenamiento contiene valores NaN/Inf. Limpia los datos o ajusta la ventana.')
+    st.stop()
+
+# Decomposition (optional visualization)
+with st.expander("Descomposición STL (sobre la serie mensual)", expanded=False):
     s_monthly = ensure_monthly(series)
     stl = STL(s_monthly, period=int(seasonal_period), robust=True).fit()
     fig, axs = plt.subplots(4,1, figsize=(10,8), sharex=True)
@@ -286,8 +300,7 @@ with st.expander("Descomposición STL (serie mensual)", expanded=False):
 
 st.subheader("Búsqueda y selección de modelos")
 with st.spinner("Entrenando ARIMA / SARIMA / SARIMAX..."):
-    out = grid_search_models(train, test, seasonal_period=int(seasonal_period),
-                             max_pq=int(max_pq), K_fourier=range(K_min, K_max+1))
+    out = grid_search_models(train, test, seasonal_period=int(seasonal_period), max_pq=int(max_pq), K_fourier=range(K_min, K_max+1))
 
 if out["best"] is None or len(out["summary"]) == 0:
     st.error("No fue posible ajustar modelos válidos. Revisa los datos.")
@@ -295,15 +308,13 @@ if out["best"] is None or len(out["summary"]) == 0:
 
 st.markdown("### Ranking de modelos")
 display_cols = ["model", "order", "seasonal_order", "exog", "aic", "mape", "jb_p", "lb_p", "arch_p"]
-st.dataframe(out["summary"][display_cols].style.format({
-    "aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"
-}))
+st.dataframe(out["summary"][display_cols].style.format({"aic":"{:.1f}", "mape":"{:.2f}%", "jb_p":"{:.3f}", "lb_p":"{:.3f}", "arch_p":"{:.3f}"}))
 
 best = out["best"]
-st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} "
-           f"| exog={best['exog']} | MAPE={best['mape']:.2f}%")
+st.success(f"**Mejor modelo:** {best['model']} | order={best['order']} | seasonal={best['seasonal_order']} | exog={best['exog']} | MAPE={best['mape']:.2f}%")
 
-# Recuperar el forecast de la fila ganadora
+# Refit best to full train for plotting and diagnostics
+# Retrieve forecast series from the summary table row matching 'best'
 def find_forecast_series(summary_df, best_dict):
     mask = (summary_df["model"]==best_dict["model"]) & \
            (summary_df["order"]==tuple(best_dict["order"])) & \
@@ -315,17 +326,19 @@ def find_forecast_series(summary_df, best_dict):
 fc = find_forecast_series(out["summary"], best)
 
 st.markdown("### Pronóstico vs. Real (ventana de evaluación)")
-plot_series(train, test, fc, "Pronóstico sobre evaluación (2023-01 a 2025-05)")
+plot_series(train, test, fc, "Pronóstico sobre la muestra de evaluación")
 
-st.markdown("### Diagnósticos del mejor modelo (p-values)")
+# Residuals diagnostics for the best model
+st.markdown("### Diagnósticos del mejor modelo")
 st.write({
-    "Jarque–Bera (normalidad)": round(float(best["jb_p"]), 4),
-    "Ljung–Box (no autocorrelación)": round(float(best["lb_p"]), 4),
-    "ARCH (no heterocedasticidad)": round(float(best["arch_p"]), 4),
+    "Jarque–Bera p-value (normalidad)": round(float(best["jb_p"]), 4),
+    "Ljung–Box p-value (no autocorrelación)": round(float(best["lb_p"]), 4),
+    "ARCH p-value (no heterocedasticidad)": round(float(best["arch_p"]), 4),
 })
 
-# Reentreno sólo para visualizar residuos de train del mejor
-def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_period):
+# Refit the best model to combine train+test for residuals visualization (optional)
+# For residuals during train fit:
+def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_period, exog_desc):
     if model_name.startswith("SARIMAX"):
         import re
         k = int(re.search(r"K=(\d+)", model_name).group(1))
@@ -337,11 +350,10 @@ def refit_and_get_resid(model_name, order, seasonal_order, train, seasonal_perio
                       enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
     return res.resid.dropna()
 
-resid_best = refit_and_get_resid(best["model"], tuple(best["order"]), tuple(best["seasonal_order"]),
-                                 train, int(seasonal_period))
+resid_best = refit_and_get_resid(best["model"], tuple(best["order"]), tuple(best["seasonal_order"]), train, int(seasonal_period), best["exog"])
 plot_residuals(resid_best, title_prefix=f"{best['model']}")
 
-# Exportables
+# Export results
 st.markdown("### Exportar resultados")
 export = {
     "best_model": {
@@ -357,20 +369,15 @@ export = {
             "arch": float(best["arch_p"])
         }
     },
-    "evaluation_window": {
-        "test_start": str(test.index.min()),
-        "test_end": str(test.index.max())
-    },
+    "evaluation_window": {"test_start": str(test.index.min()), "test_end": str(test.index.max())},
 }
 
 json_bytes = io.BytesIO()
 json_bytes.write(pd.Series(export).to_json().encode("utf-8"))
 json_bytes.seek(0)
-st.download_button("Descargar resumen JSON", data=json_bytes,
-                   file_name="soya_model_summary.json", mime="application/json")
+st.download_button("Descargar resumen JSON", data=json_bytes, file_name="soya_model_summary.json", mime="application/json")
 
 csv_bytes = io.BytesIO()
 pd.DataFrame({"real": test, "forecast": fc}).to_csv(csv_bytes, index=True)
 csv_bytes.seek(0)
-st.download_button("Descargar pronóstico (CSV)", data=csv_bytes,
-                   file_name="forecast_eval.csv", mime="text/csv")
+st.download_button("Descargar pronóstico (CSV)", data=csv_bytes, file_name="forecast_eval.csv", mime="text/csv")
