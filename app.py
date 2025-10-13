@@ -96,7 +96,9 @@ def diagnostics(res) -> Dict[str, float]:
     resid = res.resid.dropna()
     lb_lags = min(24, max(2, int(np.sqrt(len(resid)))))
     arch_lags = min(12, max(2, int(np.sqrt(len(resid)) // 2)))
-    jb_stat, jb_p, _, _ = jarque_bera(resid)
+    
+    jb_stat, jb_p = stats.jarque_bera(resid_best)
+
     lb_p = acorr_ljungbox(resid, lags=[lb_lags], return_df=True)["lb_pvalue"].iloc[0]
     arch_p = het_arch(resid, nlags=arch_lags)[1]
     return {"jb_p": jb_p, "lb_p": lb_p, "arch_p": arch_p, "resid": resid}
