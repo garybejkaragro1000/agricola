@@ -153,7 +153,9 @@ mean_resid = np.mean(resid_best)
 std_resid = np.std(resid_best, ddof=1)
 skew_resid = stats.skew(resid_best)
 kurt_resid = stats.kurtosis(resid_best, fisher=False)
-jb_stat, jb_p, _, _ = stats.jarque_bera(resid_best)
+
+jb_stat, jb_p = stats.jarque_bera(resid_best)
+
 
 df_norm = pd.DataFrame({
     "Estadístico": [
